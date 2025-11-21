@@ -1,5 +1,5 @@
 // scripts/guidedImpersonate2nd.js
-import { getContext, extension_settings, extensionName, debugLog, handleSwitching, getPreviousImpersonateInput, setPreviousImpersonateInput, getLastImpersonateResult, setLastImpersonateResult } from './persistentGuides/guideExports.js'; // Import from central hub
+import { getContext, extension_settings, extensionName, debugLog, handleSwitching, getPreviousImpersonateInput, setPreviousImpersonateInput, getLastImpersonateResult, setLastImpersonateResult, consumeImpersonateRestoreFallback } from './persistentGuides/guideExports.js'; // Import from central hub
 
 const guidedImpersonate2nd = async () => {
     const textarea = document.getElementById('send_textarea');
@@ -12,7 +12,8 @@ const guidedImpersonate2nd = async () => {
 
     // Check if the current input matches the last generated text
     if (lastGeneratedText && currentInputText === lastGeneratedText) {
-        textarea.value = getPreviousImpersonateInput(); // Use getter
+        const fallback = consumeImpersonateRestoreFallback();
+        textarea.value = fallback || getPreviousImpersonateInput(); // Use getter
         textarea.dispatchEvent(new Event('input', { bubbles: true }));
         return; // Restoration done, exit
     }

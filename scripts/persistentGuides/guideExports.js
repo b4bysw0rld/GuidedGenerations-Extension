@@ -27,6 +27,7 @@ function debugWarn(...args) {
 // Shared state functions for impersonate input management
 let previousImpersonateInput = '';
 let lastImpersonateResult = '';
+let impersonateRestoreFallback = '';
 
 function setPreviousImpersonateInput(input) {
     previousImpersonateInput = input;
@@ -42,6 +43,16 @@ function setLastImpersonateResult(result) {
 
 function getLastImpersonateResult() {
     return lastImpersonateResult;
+}
+
+function setImpersonateRestoreFallback(value) {
+    impersonateRestoreFallback = typeof value === 'string' ? value : '';
+}
+
+function consumeImpersonateRestoreFallback() {
+    const value = impersonateRestoreFallback;
+    impersonateRestoreFallback = '';
+    return value;
 }
 
 // Group chat detection function
@@ -197,6 +208,8 @@ export {
     getPreviousImpersonateInput,
     setLastImpersonateResult,
     getLastImpersonateResult,
+    setImpersonateRestoreFallback,
+    consumeImpersonateRestoreFallback,
     
     // Debug logging functions
     getDebugMessages,

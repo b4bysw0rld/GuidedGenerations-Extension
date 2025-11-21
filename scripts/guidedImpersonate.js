@@ -1,5 +1,22 @@
 // scripts/guidedImpersonate.js
-import { getContext, extension_settings, extensionName, debugLog, handleSwitching, getPreviousImpersonateInput, setPreviousImpersonateInput, getLastImpersonateResult, setLastImpersonateResult } from './persistentGuides/guideExports.js'; // Import from central hub
+import { getContext, extension_settings, extensionName, debugLog, handleSwitching, getPreviousImpersonateInput, setPreviousImpersonateInput, getLastImpersonateResult, setLastImpersonateResult, consumeImpersonateRestoreFallback } from './persistentGuides/guideExports.js'; // Import from central hub
+
+let isGuidedImpersonateRunning = false;
+
+const PLACEHOLDER = '{{input}}';
+
+function fillPrompt(template = '', userText = '') {
+    if (!template.includes(PLACEHOLDER)) {
+        return template || userText;
+    }
+    return template.split(PLACEHOLDER).join(userText);
+}
+
+function sanitizeForSTScript(text = '') {
+    return text
+        .replace(/\r?\n/g, ' ')
+        .replace(/\|/g, '\\|');
+}
 
 const guidedImpersonate = async () => {
     const textarea = document.getElementById('send_textarea');
@@ -12,27 +29,20 @@ const guidedImpersonate = async () => {
 
     // Check if the current input matches the last generated text
     if (lastGeneratedText && currentInputText === lastGeneratedText) {
-        textarea.value = getPreviousImpersonateInput(); // Use getter
+        const fallback = consumeImpersonateRestoreFallback();
+        textarea.value = fallback || getPreviousImpersonateInput(); // Use getter / fallback
         textarea.dispatchEvent(new Event('input', { bubbles: true }));
         return; // Restoration done, exit
     }
 
+    if (isGuidedImpersonateRunning) {
+        debugLog('[Impersonate-1st] Execution skipped because another run is in progress.');
+        return;
+    }
+    isGuidedImpersonateRunning = true;
+
     // --- If not restoring, proceed with impersonation ---
     setPreviousImpersonateInput(currentInputText); // Use setter
-
-    // Capture the original profile BEFORE any switching happens
-    const context = getContext();
-    let originalProfile = '';
-    if (context && typeof context.executeSlashCommandsWithOptions === 'function') {
-        try {
-            // Get current profile before any switching
-            const { getCurrentProfile } = await import('./persistentGuides/guideExports.js');
-            originalProfile = await getCurrentProfile();
-            debugLog(`[Impersonate-1st] Captured original profile before switching: "${originalProfile}"`);
-        } catch (error) {
-            debugLog(`[Impersonate-1st] Could not get original profile:`, error);
-        }
-    }
 
     // Handle profile and preset switching using unified utility
     const profileKey = 'profileImpersonate1st';
@@ -49,14 +59,15 @@ const guidedImpersonate = async () => {
     
     debugLog(`[Impersonate-1st] Using profile: ${profileValue || 'current'}, preset: ${presetValue || 'none'}`);
     
-    const { switch: switchProfileAndPreset, restore } = await handleSwitching(profileValue, presetValue, originalProfile);
+    const { switch: switchProfileAndPreset, restore } = await handleSwitching(profileValue, presetValue);
 
     // Use user-defined impersonate prompt override
     const promptTemplate = extension_settings[extensionName]?.promptImpersonate1st ?? '';
-    const filledPrompt = promptTemplate.replace('{{input}}', currentInputText);
+    const filledPrompt = fillPrompt(promptTemplate, currentInputText);
+    const sanitizedPrompt = sanitizeForSTScript(filledPrompt);
 
     // Build STScript without preset switching
-    const stscriptCommand = `/impersonate await=true ${filledPrompt} |`;
+    const stscriptCommand = `/impersonate await=true ${sanitizedPrompt} |`;
     const fullScript = `// Impersonate guide|\n${stscriptCommand}`;
 
     try {
@@ -78,24 +89,19 @@ const guidedImpersonate = async () => {
             setLastImpersonateResult(textarea.value);
             debugLog('[Impersonate-1st] STScript executed, new input stored in shared state.');
 
-            // After completion, restore original profile and preset using utility restore function
-            await restore();
-            
-            debugLog('[Impersonate-1st] Profile restore complete');
-
         } else {
             console.error('[GuidedGenerations] context.executeSlashCommandsWithOptions not found!');
         }
     } catch (error) {
         console.error(`[GuidedGenerations] Error executing Guided Impersonate (1st) stscript: ${error}`);
         setLastImpersonateResult(''); // Use setter to clear shared state on error
-        
-        debugLog('[Impersonate-1st] Error occurred, about to restore profile...');
-        
-        // Restore original profile and preset on error
-        await restore();
-        
-        debugLog('[Impersonate-1st] Profile restore complete after error');
+    } finally {
+        try {
+            await restore();
+            debugLog('[Impersonate-1st] Profile restore complete');
+        } finally {
+            isGuidedImpersonateRunning = false;
+        }
     }
 };
 

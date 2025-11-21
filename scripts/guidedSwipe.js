@@ -1,37 +1,111 @@
 // scripts/guidedSwipe.js
 
-import { getContext, extension_settings, debugLog, setPreviousImpersonateInput, getPreviousImpersonateInput } from './persistentGuides/guideExports.js'; // Import from central hub
+import { getContext, extension_settings, debugLog, setPreviousImpersonateInput, getPreviousImpersonateInput, setImpersonateRestoreFallback } from './persistentGuides/guideExports.js'; // Import from central hub
 
-// Helper function for delays
-const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const extensionName = "GuidedGenerations-Extension";
-// Helper function to execute STScripts using the context method
-// NOTE: This version assumes executeSlashCommandsWithOptions exists and handles errors locally.
-// It might need adjustments based on the exact SillyTavern API if it changes.
-async function executeSTScriptCommand(command) {
-    try {
-        // Check if SillyTavern context is available
-        if (typeof SillyTavern !== 'undefined' && typeof SillyTavern.getContext === 'function') {
-            const context = SillyTavern.getContext();
-            // Check if the method exists on the context
-            if (typeof context.executeSlashCommandsWithOptions === 'function') {
-                // Execute the command via the context
-                await context.executeSlashCommandsWithOptions(command, { /* options if needed, e.g., showOutput: false */ });
-            } else {
-                console.error('[GuidedGenerations] context.executeSlashCommandsWithOptions function not found.');
-                alert("Guided Swipe Error: Cannot find the function to execute STScript commands on the context.");
-                throw new Error("STScript execution method executeSlashCommandsWithOptions not found on context.");
-            }
-        } else {
-            console.error('[GuidedGenerations] SillyTavern.getContext function not found.');
-            alert("Guided Swipe Error: Cannot access SillyTavern context.");
-            throw new Error("SillyTavern.getContext not found.");
-        }
-    } catch (error) {
-        console.error(`[GuidedGenerations] Error executing STScript command "${command}":`, error);
-        // Re-throw the error to be caught by the calling function's try/catch block
-        throw error;
+const PLACEHOLDER = '{{input}}';
+const GENERATION_TIMEOUT_MS = 20000;
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function fillPrompt(template = '', userText = '') {
+    if (!template.includes(PLACEHOLDER)) {
+        return template || userText;
     }
+    return template.split(PLACEHOLDER).join(userText);
+}
+
+function sanitizeForSTScript(text = '') {
+    return text
+        .replace(/\r?\n/g, ' ')
+        .replace(/\|/g, '\\|');
+}
+
+function notifySwipeError(message) {
+    if (window?.toastr?.error) {
+        window.toastr.error(message, 'Guided Swipe');
+    } else {
+        console.error(`[GuidedGenerations][Swipe] ${message}`);
+    }
+}
+
+async function runSlashCommand(context, command, options = { displayCommand: false, showOutput: false }) {
+    if (!context || typeof context.executeSlashCommandsWithOptions !== 'function') {
+        throw new Error('SillyTavern context missing executeSlashCommandsWithOptions');
+    }
+    await context.executeSlashCommandsWithOptions(command, options);
+}
+
+function cloneInstruct(instruct) {
+    try {
+        return JSON.parse(JSON.stringify(instruct));
+    } catch (error) {
+        debugLog('[Swipe] Failed to clone instruct injection', error);
+        return null;
+    }
+}
+
+async function backupExistingInstruct(context) {
+    const existing = context?.chatMetadata?.script_injects?.instruct;
+    if (!existing) return null;
+    const cloned = cloneInstruct(existing);
+    await runSlashCommand(context, '/flushinject instruct');
+    return cloned;
+}
+
+async function restoreInstruct(context, saved, fallbackRole) {
+    if (!saved) return;
+    const role = saved.role || fallbackRole || 'system';
+    const scan = typeof saved.scan === 'boolean' ? saved.scan : true;
+    const depth = typeof saved.depth === 'number' ? saved.depth : 0;
+    const value = saved.value || '';
+    const command = `/inject id=instruct position=chat ephemeral=true scan=${scan} depth=${depth} role=${role} ${value}`;
+    await runSlashCommand(context, command);
+}
+
+async function ensureInjectionExists(context, attempts = 5, waitMs = 150) {
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        const instruct = context?.chatMetadata?.script_injects?.instruct;
+        if (instruct) {
+            return true;
+        }
+        if (attempt < attempts) {
+            await delay(waitMs);
+        }
+    }
+    return false;
+}
+
+function waitForGeneration(eventSource, event_types) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            reject(new Error('Swipe generation timed out.'));
+        }, GENERATION_TIMEOUT_MS);
+
+        const handleSuccess = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(true);
+        };
+
+        const handleStop = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(new Error('Swipe generation stopped.'));
+        };
+
+        eventSource.once(event_types.GENERATION_ENDED, handleSuccess);
+        if (event_types?.GENERATION_STOPPED) {
+            eventSource.once(event_types.GENERATION_STOPPED, handleStop);
+        }
+        if (event_types?.GENERATION_ERROR) {
+            eventSource.once(event_types.GENERATION_ERROR, handleStop);
+        }
+    });
 }
 
 /**
@@ -40,16 +114,14 @@ async function executeSTScriptCommand(command) {
  * Uses direct manipulation for navigation and waits for generation end event.
  * @returns {Promise<boolean>} True if successful, false otherwise.
  */
-async function generateNewSwipe() {
+async function generateNewSwipe(context) {
     // Ensure necessary functions/objects are available from SillyTavern's scope
-    let context = getContext();
     const expectedContextProps = ['chat', 'messageFormatting', 'eventSource', 'event_types'];
     const missingProps = expectedContextProps.filter(prop => !(prop in context) || context[prop] === undefined);
 
     if (missingProps.length > 0) {
         const errorMessage = `Could not get necessary functions/objects from context. Missing: ${missingProps.join(', ')}`;
-        console.error(`[GuidedGenerations][Swipe] ${errorMessage}`);
-        alert(`Guided Swipe Error: ${errorMessage}`);
+        notifySwipeError(errorMessage);
         return false;
     }
 
@@ -58,10 +130,8 @@ async function generateNewSwipe() {
 
     try {
         // --- 1. Navigate to Last Existing Swipe (Directly) ---
-        context = getContext(); // Get fresh context again before manipulation
-        if (!context || context.chat.length === 0) {
-            console.error("[GuidedGenerations][Swipe] Could not get chat context for swiping.");
-            alert("Guided Swipe Error: Cannot access chat context.");
+        if (!context || !Array.isArray(context.chat) || context.chat.length === 0) {
+            notifySwipeError('Cannot access chat context.');
             return false;
         }
         let lastMessageIndex = context.chat.length - 1;
@@ -97,8 +167,7 @@ async function generateNewSwipe() {
                 eventSource.emit(event_types.MESSAGE_SWIPED, lastMessageIndex);
                 // Update button visibility - Removed showSwipeButtons() as it's not available
                 // showSwipeButtons();
-                // Use standard setTimeout for delay as context.delay is missing
-                await new Promise(resolve => setTimeout(resolve, 150)); // Delay for UI updates/event propagation
+                await delay(150);
             } else {
                 debugLog("[Swipe] Already on the last existing swipe.");
             }
@@ -107,48 +176,29 @@ async function generateNewSwipe() {
         }
 
         // --- 2. Trigger the *New* Swipe Generation (Using context.swipe.right()) ---
-        context = getContext(); // Get fresh context again before calling swipe.right
         if (!context || !context.swipe || typeof context.swipe.right !== 'function') {
-            const warningMessage = "Guided Generations Feature Error: Core functionality (like SillyTavern.getContext().swipe.right) is missing. Please update SillyTavern to version 1.13.0 or newer for Swipe, Correction, and Edit Intro features to work correctly.";
-            console.error(`[GuidedGenerations][Swipe] ${warningMessage}`);
-            alert(warningMessage);
+            const warningMessage = "Core swipe functionality is missing. Please update SillyTavern to v1.13.0+ for Guided Swipe to work.";
+            notifySwipeError(warningMessage);
             return false;
         }
 
         debugLog("[Swipe] Calling context.swipe.right() to trigger new swipe generation...");
-        context.swipe.right(); // THE VITAL CALL TO START GENERATION
-
-        // --- 3. Wait for Generation to Finish ---
-        const generationPromise = new Promise((resolve) => {
-            const successListener = () => {
-                debugLog("[Swipe] Generation ended signal received.");
-                resolve(true);
-            };
-
-            eventSource.once(event_types.GENERATION_ENDED, successListener);
-        });
-
-        // Await the generation promise (will throw on error)
+        const generationPromise = waitForGeneration(eventSource, event_types);
+        context.swipe.right();
         await generationPromise;
-        // Use standard setTimeout for delay as context.delay is missing
-        await new Promise(resolve => setTimeout(resolve, 200)); // Small delay after generation finishes
+        await delay(200);
 
         // Re-check context to confirm swipe count increased (optional but good practice)
-        context = getContext(); // Get latest context
-        const finalMessageData = context.chat[context.chat.length - 1];
+        const latestContext = getContext();
+        const latestChat = Array.isArray(latestContext?.chat) ? latestContext.chat : null;
+        const finalMessageData = latestChat ? latestChat[latestChat.length - 1] : null;
         const finalSwipeCount = finalMessageData?.swipes?.length ?? 0;
         debugLog(`[Swipe] Final swipe count after generation: ${finalSwipeCount}`);
 
         return true; // Indicate success
 
     } catch (error) {
-        console.error("[GuidedGenerations][Swipe] Error during swipe generation process:", error);
-        // Format error for alert, preventing duplicate prefixes if already formatted
-        const errorMessage = String(error.message || error).startsWith('Guided Swipe Error:')
-            ? String(error.message || error)
-            : `Guided Swipe Error: ${error.message || error}`;
-        // Ensure alert is shown even if error is just a string
-        alert(errorMessage || "Guided Swipe Error: An unknown error occurred.");
+        notifySwipeError(error.message || 'Swipe generation failed.');
         return false; // Indicate failure
     }
 }
@@ -162,17 +212,24 @@ const guidedSwipe = async () => {
     const textarea = document.getElementById('send_textarea');
     if (!textarea) {
         console.error('[GuidedGenerations][Swipe] Textarea #send_textarea not found.');
-        alert("Guided Swipe Error: Textarea not found.");
+        notifySwipeError('Textarea not found.');
         return; // Cannot proceed without textarea
     }
     const originalInput = textarea.value; // Get current input
+    const sharedInputSnapshot = getPreviousImpersonateInput();
+    setImpersonateRestoreFallback(sharedInputSnapshot);
 
     const depth = extension_settings[extensionName]?.depthPromptGuidedSwipe ?? 0;
+    const context = getContext();
+    if (!context) {
+        notifySwipeError('SillyTavern context unavailable.');
+        return;
+    }
 
     // If no input, skip injection and do a plain swipe
     if (!originalInput.trim()) {
         debugLog("[Swipe] No input detected, performing plain swipe.");
-        const swipeSuccess = await generateNewSwipe();
+        const swipeSuccess = await generateNewSwipe(context);
         if (swipeSuccess) {
             debugLog("[Swipe] Swipe finished successfully.");
         } else {
@@ -183,6 +240,8 @@ const guidedSwipe = async () => {
 
     // Get the LATEST injection role setting HERE
     const injectionRole = extension_settings[extensionName]?.injectionEndRole ?? 'system'; // Get the role setting
+    let savedInstruct = null;
+    let injectedForSwipe = false;
 
     try {
         // Save the input state using the shared function (imported)
@@ -190,69 +249,34 @@ const guidedSwipe = async () => {
 
         // Use user-defined guided swipe prompt override
         const promptTemplate = extension_settings[extensionName]?.promptGuidedSwipe ?? '';
-        const filledPrompt = promptTemplate.replace('{{input}}', originalInput);
+        const filledPrompt = fillPrompt(promptTemplate, originalInput);
+        const sanitizedPrompt = sanitizeForSTScript(filledPrompt);
 
         // --- 1. Store Input & Inject Context (if any) --- (Use direct context method)
-        if (originalInput.trim() || (promptTemplate.trim() !== '' && promptTemplate.trim() !== '{{input}}')) {
-            // Use the currentInjectionRole retrieved above
-            const stscriptCommand = `/inject id=instruct position=chat ephemeral=true scan=true depth=${depth} role=${injectionRole} ${filledPrompt} |`;
-            
-            // Get context and execute directly
-            if (typeof SillyTavern !== 'undefined' && typeof SillyTavern.getContext === 'function') {
-                const context = SillyTavern.getContext();
-                if (typeof context.executeSlashCommandsWithOptions === 'function') {
-                    await context.executeSlashCommandsWithOptions(stscriptCommand);
-                    debugLog('[Swipe] Executed Command:', stscriptCommand); 
-                } else {
-                    throw new Error("context.executeSlashCommandsWithOptions function not found.");
-                }
-            } else {
-                throw new Error("SillyTavern.getContext function not found.");
-            }
+        if (originalInput.trim() || (promptTemplate.trim() !== '' && promptTemplate.trim() !== PLACEHOLDER)) {
+            savedInstruct = await backupExistingInstruct(context);
+            const stscriptCommand = `/inject id=instruct position=chat ephemeral=true scan=true depth=${depth} role=${injectionRole} ${sanitizedPrompt} |`;
+            await runSlashCommand(context, stscriptCommand);
+            injectedForSwipe = true;
+            debugLog('[Swipe] Executed Command:', stscriptCommand);
         } else {
             debugLog("[Swipe] No input detected, skipping injection.");
         }
         
-
-        // Wait for the injection to appear in context (with retries and delay)
-        let injectionFound = false;
-        const maxAttempts = 5; // Keep the number of attempts
-        const checkDelay = 150; // Milliseconds to wait between checks
-
-        for (let i = 0; i < maxAttempts; i++) {
-            const currentContext = SillyTavern.getContext(); // Get fresh context each time
-            if (currentContext.chatMetadata?.script_injects?.instruct) {
-                debugLog(`[Swipe] Injection found after attempt ${i + 1}.`);
-                injectionFound = true;
-                break; // Exit loop once found
-
+        if (injectedForSwipe) {
+            const injectionExists = await ensureInjectionExists(context);
+            if (!injectionExists) {
+                throw new Error("Could not verify 'instruct' injection. Aborting swipe generation.");
             }
-            // If not found, wait before the next check (unless it's the last attempt)
-            if (i < maxAttempts - 1) {
-                debugLog(`[Swipe] Injection check ${i + 1} failed, waiting ${checkDelay}ms...`);
-                await new Promise(resolve => setTimeout(resolve, checkDelay));
-            }
-        }
-
-        // If injection was never found after all attempts
-        if (!injectionFound) {
-            const errorMsg = "[GuidedGenerations][Swipe] Critical Error: Guided instruction injection ('instruct') failed to appear in chatMetadata.script_injects after multiple checks.";
-            console.error(errorMsg);
-            alert("Guided Swipe Error: Could not verify instruction injection ('instruct'). Aborting swipe generation.");
-            // Clean up potentially failed injection attempt and restore input before returning
-            textarea.value = originalInput;
-            // Use the correct key for deletion as well
-            await executeSTScriptCommand('/flushinject instruct');
-            return; // Stop execution
         }
 
                 // --- 2. Generate the new swipe --- (This now only runs if injection was found)
         debugLog('[Swipe] Instruction injection confirmed. Proceeding to generate new swipe...');
-        const swipeSuccess = await generateNewSwipe();
+        const swipeSuccess = await generateNewSwipe(context);
 
         if (swipeSuccess) {
             debugLog("[Swipe] Guided Swipe finished successfully.");
-            await new Promise(resolve => setTimeout(resolve, 3000));
+            await delay(300);
         } else {
             console.error("[GuidedGenerations][Swipe] Guided Swipe failed during swipe generation step.");
             // Error likely already alerted within generateNewSwipe
@@ -261,10 +285,7 @@ const guidedSwipe = async () => {
     } catch (error) {
         // Catch errors specific to the guidedSwipe wrapper (e.g., from executeSTScriptCommand)
         console.error("[GuidedGenerations][Swipe] Error during guided swipe wrapper execution:", error);
-        // Avoid duplicate alerts if generateNewSwipe already alerted
-        if (!String(error.message).startsWith('Guided Swipe Error:')) {
-            alert(`Guided Swipe Error: ${error.message}`);
-        }
+        notifySwipeError(error.message || 'Guided Swipe failed.');
     } finally {
         // Always attempt to restore the input field from the shared state (imported)
         if (textarea) { // Check if textarea was found initially
@@ -276,9 +297,22 @@ const guidedSwipe = async () => {
             // This case should ideally not happen if the initial check passed
             debugLog("[Swipe] Textarea was not available for restoration in finally block.");
         }
-        // Clean up injection using the correct key
-        debugLog('[Swipe] Cleaning up injection (finally block)');
-        await executeSTScriptCommand('/flushinject instruct'); // Already using 'instruct' ID here, which seems correct
+        if (context) {
+            if (injectedForSwipe) {
+                try {
+                    await runSlashCommand(context, '/flushinject instruct');
+                } catch (flushError) {
+                    debugLog('[Swipe] No swipe injection to flush or flush failed.', flushError);
+                }
+            }
+            // Restore previously saved instruct injection if any
+            try {
+                await restoreInstruct(context, savedInstruct, injectionRole);
+            } catch (restoreError) {
+                console.error('[GuidedGenerations][Swipe] Failed to restore prior instruct injection:', restoreError);
+            }
+        }
+
     }
 };
 
