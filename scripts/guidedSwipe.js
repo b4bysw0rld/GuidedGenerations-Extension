@@ -4,7 +4,6 @@ import { getContext, extension_settings, debugLog, setPreviousImpersonateInput, 
 
 const extensionName = "GuidedGenerations-Extension";
 const PLACEHOLDER = '{{input}}';
-const GENERATION_TIMEOUT_MS = 20000;
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function fillPrompt(template = '', userText = '') {
@@ -75,26 +74,19 @@ async function ensureInjectionExists(context, attempts = 5, waitMs = 150) {
     return false;
 }
 
+/**
+ * Waits for generation to complete via SillyTavern events.
+ * No timeout is used - relies on event-based completion for reliability.
+ * The generation will complete when GENERATION_ENDED fires, or fail if
+ * GENERATION_STOPPED or GENERATION_ERROR fire. User can manually stop at any time.
+ */
 function waitForGeneration(eventSource, event_types) {
     return new Promise((resolve, reject) => {
-        let settled = false;
-        const timer = setTimeout(() => {
-            if (settled) return;
-            settled = true;
-            reject(new Error('Swipe generation timed out.'));
-        }, GENERATION_TIMEOUT_MS);
-
         const handleSuccess = () => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
             resolve(true);
         };
 
         const handleStop = () => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
             reject(new Error('Swipe generation stopped.'));
         };
 
